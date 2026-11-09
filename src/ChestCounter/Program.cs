@@ -751,8 +751,16 @@ List<(string Label, Action Run, string? About)> Items()
                         config.OverlayStyle = styles[(Array.IndexOf(styles, config.OverlayStyle) + 1) % styles.Length];
                         NativeOverlay.SetStyle(config.OverlayStyle);
                     }, L.T("HUD : seuls les chiffres restent, sans fond, comme ceux du jeu (place-le sous la minimap ; un fond apparaît quand il est déverrouillé, pour le déplacer). Classique : la carte sombre des versions précédentes. Entrée pour changer, appliqué tout de suite.",
-                        "HUD: only the figures remain, with no background, like the game's (put it under the minimap; a background shows while it is unlocked, to move it). Classic: the dark card of earlier versions. Enter to switch, applied at once.",
+                        "HUD: four compact counters snap below the minimap. Unlock to drag them into place. Classic: the original dark card. Enter to switch.",
                         "HUD: solo quedan las cifras, sin fondo, como las del juego (ponlo bajo el minimapa; aparece un fondo al desbloquearlo, para moverlo). Clásico: la tarjeta oscura de versiones anteriores. Intro para cambiar, se aplica al instante.")));
+                    if (config.OverlayStyle == "hud")
+                    {
+                        list.Add(Item(L.T("Replacer sous la mini-carte", "Snap below minimap", "Colocar bajo el minimapa"), () =>
+                        {
+                            config.OverlayHudAutoPosition = true;
+                            NativeOverlay.SnapToMinimap();
+                        }));
+                    }
                     list.Add(Item($"{L.T("Taille de l'overlay", "Overlay size", "Tamaño del overlay")} : {Percent(config.OverlaySize)}", () =>
                     {
                         config.OverlaySize = OverlayAppearance.Next(OverlayAppearance.Sizes, config.OverlaySize);
@@ -1099,6 +1107,10 @@ void StartOverlay()
     NativeOverlay.Start(config.OverlayX, config.OverlayY, config.OverlayLocked,
         (x, y) =>
         {
+            if (config.OverlayStyle == "hud")
+            {
+                config.OverlayHudAutoPosition = false;
+            }
             config.OverlayX = x;
             config.OverlayY = y;
             try { store.SaveConfig(config); } catch { /* ignore */ }
@@ -1107,7 +1119,7 @@ void StartOverlay()
         {
             config.OverlayLocked = locked;
             try { store.SaveConfig(config); } catch { /* ignore */ }
-        });
+        }, config.OverlayHudAutoPosition);
     UpdateOverlay(store, config, data, tracker.LiveMatch, tracker.IsLive);
 }
 

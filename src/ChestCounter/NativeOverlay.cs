@@ -34,6 +34,9 @@ public static class NativeOverlay
     private static Action<bool>? _onLockChanged;
     private static volatile bool _locked;
     private static bool _offscreen;
+    private static bool _autoPosition;
+    private static float _hudScale;
+    private static int _hudCellW, _hudRowH;
     private static int _stableW;
     private static RECT _lockRect; // lock button, client coordinates
     private static IntPtr _fontIcon;
@@ -46,12 +49,10 @@ public static class NativeOverlay
 
     /// <summary>"hud" (figures only, under the minimap, like the game's HUD) or "classic" (dark card).</summary>
     private static volatile string _style = "classic";
-    private static IntPtr _fontHudBig, _fontHudSmall;
-    private static int _hudBigH, _hudSmallH;
+    private static IntPtr _fontHud;
 
-    /// <summary>Pixels of this color are fully transparent (styles without a background). Almost black, so that the
-    /// anti-aliased edge of the black outline around the text blends into it without any colored fringe.</summary>
-    private static readonly uint KeyColor = 0x00010001;
+    // Reset WS_EX_LAYERED when switching from uniform to per-pixel alpha.
+    private static bool _usesUniformAlpha;
 
     public static string[] Styles => new[] { "hud", "classic" };
 
@@ -65,7 +66,7 @@ public static class NativeOverlay
         }
     }
 
-    private static bool Keyed => _style != "classic";
+    private static bool IsHud => _style != "classic";
 
     private const int MinWidth = 240, Pad = 16, ColGap = 36;
 
@@ -111,7 +112,7 @@ public static class NativeOverlay
     /// <summary>Locked = click-through: the mouse goes through the overlay and it cannot be moved.</summary>
     public static bool IsLocked => _locked;
 
-    public static void Start(int? x, int? y, bool locked, Action<int, int> onMoved, Action<bool> onLockChanged)
+    public static void Start(int? x, int? y, bool locked, Action<int, int> onMoved, Action<bool> onLockChanged, bool autoPosition = true)
     {
         if (_thread != null)
         {
@@ -119,6 +120,7 @@ public static class NativeOverlay
         }
 
         _onMoved = onMoved;
+        _autoPosition = autoPosition;
         _offscreen = x <= -10000; // --overlay-preview: never brought back on screen
         _onLockChanged = onLockChanged;
         _locked = locked;
@@ -172,7 +174,9 @@ public static class NativeOverlay
         var mem = CreateCompatibleDC(screen);
         var bmp = CreateCompatibleBitmap(screen, w, h);
         var old = SelectObject(mem, bmp);
-        var ok = PrintWindow(_hwnd, mem, 1 /* PW_CLIENTONLY: WM_PRINT -> WM_PRINTCLIENT */);
+        var ok = IsHud
+            ? SendMessageW(_hwnd, WM_PRINTCLIENT, mem, IntPtr.Zero) != IntPtr.Zero
+            : PrintWindow(_hwnd, mem, 1 /* PW_CLIENTONLY */);
         SelectObject(mem, old);
         var bi = new BITMAPINFOHEADER { biSize = 40, biWidth = w, biHeight = -h, biPlanes = 1, biBitCount = 32 };
         var bgra = new byte[w * h * 4];
@@ -200,6 +204,14 @@ public static class NativeOverlay
         }
     }
 
+    public static void SnapToMinimap()
+    {
+        if (_hwnd != IntPtr.Zero)
+        {
+            PostMessageW(_hwnd, WM_APP_SNAP, IntPtr.Zero, IntPtr.Zero);
+        }
+    }
+
     private static void Run(int? x, int? y, ManualResetEventSlim ready)
     {
         try { SetProcessDPIAware(); } catch { /* old Windows */ }
@@ -210,6 +222,7 @@ public static class NativeOverlay
 
         int S(int v) => (int)Math.Round(v * _scale);
 
+        _stableW = 0;
         CreateFonts();
         _brushBg = CreateSolidBrush(Rgb(18, 18, 22));
         _brushBorder = CreateSolidBrush(Rgb(58, 58, 66));
@@ -232,7 +245,7 @@ public static class NativeOverlay
             throw new InvalidOperationException("RegisterClassEx failed");
         }
 
-        int w = S(MinWidth), h = S(90);
+        int w = IsHud ? 1 : S(MinWidth), h = S(90);
         var posX = x ?? S(24);
         var posY = y ?? S(24);
 
@@ -247,6 +260,7 @@ public static class NativeOverlay
             throw new InvalidOperationException("CreateWindowEx failed");
         }
 
+        _usesUniformAlpha = false;
         ApplyLock(_hwnd, _locked, notify: false);
         Relayout(_hwnd);
         ShowWindow(_hwnd, SW_SHOWNOACTIVATE);
@@ -267,11 +281,13 @@ public static class NativeOverlay
     /// <summary>(Re)creates the fonts for the current display scaling and chosen size.</summary>
     private static void CreateFonts()
     {
-        foreach (var old in new[] { _fontBig, _fontSmall, _fontHeader, _fontCaption, _fontLabel, _fontIcon, _fontHudBig, _fontHudSmall })
+        foreach (var old in new[] { _fontBig, _fontSmall, _fontHeader, _fontCaption, _fontLabel, _fontIcon, _fontHud })
         {
             if (old != IntPtr.Zero) DeleteObject(old);
         }
         _scale = _dpiScale * _sizePercent / 100f;
+        // The HUD follows the viewport height, independent of Windows text scaling.
+        _hudScale = Math.Max(0.6f, GetSystemMetrics(SM_CYSCREEN) / 1152f) * _sizePercent / 100f;
         int S(int v) => (int)Math.Round(v * _scale);
         _fontBig = CreateFontW(-S(38), 0, 0, 0, 800, 0, 0, 0, 1, 0, 0, 5, 0, "Segoe UI");
         _fontSmall = CreateFontW(-S(14), 0, 0, 0, 500, 0, 0, 0, 1, 0, 0, 5, 0, "Segoe UI");
@@ -279,10 +295,29 @@ public static class NativeOverlay
         _fontCaption = CreateFontW(-S(11), 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, "Segoe UI");
         _fontLabel = CreateFontW(-S(13), 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, "Segoe UI");
         _fontIcon = CreateFontW(-S(14), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, "Segoe MDL2 Assets");
-        // Game-like styles: condensed italic, grayscale anti-aliasing (ClearType would leave colored edges once the
-        // background is made transparent).
-        _fontHudBig = CreateFontW(-S(40), 0, 0, 0, 700, 1, 0, 0, 1, 0, 0, 4, 0, "Bahnschrift Condensed");
-        _fontHudSmall = CreateFontW(-S(18), 0, 0, 0, 600, 1, 0, 0, 1, 0, 0, 4, 0, "Bahnschrift SemiCondensed");
+        var hudFont = Environment.GetEnvironmentVariable("CHESTCOUNTER_HUD_FONT")?.Trim();
+        if (!string.IsNullOrEmpty(hudFont) && hudFont.Length < 32)
+        {
+            var candidate = CreateFontW(-Sc(16), 0, 0, 0, 900, 0, 0, 0, 1, 0, 0, 4, 0, hudFont);
+            if (candidate != IntPtr.Zero)
+            {
+                var dc = GetDC(IntPtr.Zero);
+                var previous = SelectObject(dc, candidate);
+                var selectedFace = new System.Text.StringBuilder(64);
+                GetTextFaceW(dc, selectedFace.Capacity, selectedFace);
+                SelectObject(dc, previous);
+                ReleaseDC(IntPtr.Zero, dc);
+                if (string.Equals(hudFont, selectedFace.ToString(), StringComparison.OrdinalIgnoreCase))
+                {
+                    _fontHud = candidate;
+                    return;
+                }
+                DeleteObject(candidate);
+            }
+        }
+
+        // These HUD numerals are upright, wide and heavy at small sizes.
+        _fontHud = CreateFontW(-Sc(16), 0, 0, 0, 900, 0, 0, 0, 1, 0, 0, 4, 0, "Arial Black");
     }
 
     private static IntPtr WndProc(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam)
@@ -334,6 +369,10 @@ public static class NativeOverlay
             case WM_EXITSIZEMOVE:
                 if (GetWindowRect(hwnd, out var r))
                 {
+                    if (IsHud)
+                    {
+                        _autoPosition = false;
+                    }
                     _onMoved?.Invoke(r.Left, r.Top);
                 }
                 return IntPtr.Zero;
@@ -350,6 +389,12 @@ public static class NativeOverlay
                 Relayout(hwnd);
                 return IntPtr.Zero;
 
+            case WM_APP_SNAP:
+                _autoPosition = true;
+                Relayout(hwnd);
+                return IntPtr.Zero;
+
+            case WM_DISPLAYCHANGE:
             case WM_APP_APPEARANCE:
                 CreateFonts();
                 _stableW = 0; // the width may shrink when the overlay gets smaller
@@ -362,6 +407,10 @@ public static class NativeOverlay
                 return IntPtr.Zero;
 
             case WM_PRINTCLIENT: // snapshot (--overlay-preview): draw into the given DC
+                if (IsHud)
+                {
+                    return RenderHud(hwnd, wParam) ? (IntPtr)1 : IntPtr.Zero;
+                }
                 PaintTo(hwnd, wParam);
                 return IntPtr.Zero;
 
@@ -382,17 +431,25 @@ public static class NativeOverlay
     {
         _locked = locked;
         var alpha = Alpha;
-        var layered = locked || alpha < 255 || Keyed;
+        var layered = locked || alpha < 255 || IsHud;
         var ex = (long)GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        if (IsHud && _usesUniformAlpha)
+        {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (IntPtr)(ex & ~(long)WS_EX_LAYERED));
+        }
         ex = layered ? ex | WS_EX_LAYERED : ex & ~(long)WS_EX_LAYERED;
         ex = locked ? ex | WS_EX_TRANSPARENT : ex & ~(long)WS_EX_TRANSPARENT;
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (IntPtr)ex);
-        if (layered)
+        _usesUniformAlpha = layered && !IsHud;
+        if (_usesUniformAlpha)
         {
-            // Required for a layered window to be drawn; the key color makes the background of the game-like styles invisible.
-            SetLayeredWindowAttributes(hwnd, KeyColor, alpha, Keyed ? LWA_ALPHA | LWA_COLORKEY : LWA_ALPHA);
+            SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
         }
         SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        if (IsHud && notify)
+        {
+            RenderHud(hwnd);
+        }
         InvalidateRect(hwnd, IntPtr.Zero, true);
 
         if (notify)
@@ -436,7 +493,7 @@ public static class NativeOverlay
     /// <summary>Measures the text and resizes the window (and its rounded region) to fit it.</summary>
     private static void Relayout(IntPtr hwnd)
     {
-        if (Keyed)
+        if (IsHud)
         {
             RelayoutStyled(hwnd);
             return;
@@ -493,7 +550,7 @@ public static class NativeOverlay
             }
             SetWindowPos(hwnd, HWND_TOPMOST, nx, ny, w, h, SWP_NOACTIVATE);
             SetWindowRgn(hwnd, CreateRoundRectRgn(0, 0, w + 1, h + 1, S(18), S(18)), true); // window owns the region
-            if (nx != cur.Left || ny != cur.Top)
+            if (!_autoPosition && (nx != cur.Left || ny != cur.Top))
             {
                 _onMoved?.Invoke(nx, ny);
             }
@@ -519,7 +576,7 @@ public static class NativeOverlay
         var hdc = BeginPaint(hwnd, out var ps);
         try
         {
-            PaintTo(hwnd, hdc);
+            if (!IsHud) PaintTo(hwnd, hdc);
         }
         finally
         {
@@ -529,11 +586,6 @@ public static class NativeOverlay
 
     private static void PaintTo(IntPtr hwnd, IntPtr hdc)
     {
-        if (Keyed)
-        {
-            PaintStyled(hwnd, hdc);
-            return;
-        }
         var v = _view;
         {
             GetClientRect(hwnd, out var rc);
@@ -603,229 +655,297 @@ public static class NativeOverlay
     //    Session • 83
     //      [star] 36         treasures
 
-    private sealed record HudRow(string Label, string Value, bool Dot);
+    private enum HudIcon { Chest, Treasure, Session, MatchHistory }
 
-    private static HudRow StateRow(OverlayView v)
-    {
-        if (v.CurrentLive && v.Current is { } cur && cur != "…")
-        {
-            return new HudRow(L.T("En direct", "Live", "En directo"), cur, true);
-        }
-        if (v.CurrentLive)
-        {
-            return new HudRow(L.T("En partie", "In a match", "En partida"), "", true); // figures readable only at the end
-        }
-        return new HudRow(L.T("Dernière", "Last", "Última"), v.Last ?? "—", false);
-    }
+    private readonly record struct HudStat(string Value, HudIcon Icon);
 
-    private static int Sc(double v) => (int)Math.Round(v * _scale);
+    private static HudStat[] HudStats(OverlayView v) =>
+    [
+        new(v.Total, HudIcon.Chest),
+        new(v.Treasures, HudIcon.Treasure),
+        new(v.Session, HudIcon.Session),
+        new((v.CurrentLive ? v.Current : v.Last) is { } count && count != "…" ? count : "–", HudIcon.MatchHistory),
+    ];
 
-    private const string Sep = "  •  ";
+    private static int Sc(double value) => Math.Max(1, (int)Math.Round(value * _hudScale));
 
     private static void RelayoutStyled(IntPtr hwnd)
     {
-        var v = _view;
         var hdc = GetDC(hwnd);
-        int w, h;
         try
         {
-            var pad = Sc(8);
-            var lockW = Sc(22);
-            var bigW = TextWidth(hdc, _fontHudBig, v.Total, out _hudBigH);
-            var state = StateRow(v);
-            var sessionLabel = L.T("Session", "Session", "Sesión");
-            var rowsW = new[]
-            {
-                Sc(14) + TextWidth(hdc, _fontHudSmall, state.Label + Sep + state.Value, out _hudSmallH),
-                TextWidth(hdc, _fontHudSmall, sessionLabel + Sep + v.Session, out _),
-                Sc(22) + TextWidth(hdc, _fontHudSmall, v.Treasures, out _),
-            }.Max();
-            w = lockW + pad + Math.Max(Sc(26) + Sc(8) + bigW, rowsW) + pad + Sc(14);
-            h = pad + _hudBigH + 3 * (_hudSmallH + Sc(2)) + pad;
-            w = Math.Max(_stableW, w);
+            var textW = HudStats(_view).Max(stat => TextWidth(hdc, _fontHud, stat.Value, out _));
+            var cellW = Math.Max(Sc(75), textW + Sc(35));
+            var gap = Sc(15);
+            var lockW = Sc(23);
+            var w = Math.Max(_stableW, lockW + 2 * cellW + gap);
             _stableW = w;
-            _lockRect = new RECT { Left = Sc(2), Top = 0, Right = lockW, Bottom = h };
+            _hudCellW = (w - lockW - gap) / 2;
+            _hudRowH = Sc(27);
+            var h = 2 * _hudRowH;
+            _lockRect = new RECT { Left = 0, Top = 0, Right = lockW, Bottom = _hudRowH };
 
             GetWindowRect(hwnd, out var cur);
-            int nx = cur.Left, ny = cur.Top;
-            var mi = new MONITORINFO { cbSize = (uint)Marshal.SizeOf<MONITORINFO>() };
-            if (!_offscreen && GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), ref mi))
+            var nx = cur.Left;
+            var ny = cur.Top;
+            if (!_offscreen && _autoPosition)
             {
-                var work = mi.rcWork;
-                if (cur.Right - cur.Left > 0 && (cur.Left + cur.Right) / 2 > (work.Left + work.Right) / 2)
+                // Reference screenshot: map right at 2021, bottom at 212 on a 2048 × 1152 viewport.
+                // Leave an 8 px gap at that height. The primary monitor origin is (0, 0).
+                var height = GetSystemMetrics(SM_CYSCREEN);
+                nx = GetSystemMetrics(SM_CXSCREEN) - (int)Math.Round(height * (27.0 / 1152)) - w;
+                ny = (int)Math.Round(height * (220.0 / 1152));
+            }
+            else if (!_offscreen)
+            {
+                var mi = new MONITORINFO { cbSize = (uint)Marshal.SizeOf<MONITORINFO>() };
+                if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), ref mi))
                 {
-                    nx = cur.Right - w; // anchored on the right edge (under the minimap)
+                    var bounds = mi.rcMonitor;
+                    if (cur.Right - cur.Left > 1 && cur.Left + (cur.Right - cur.Left) / 2 > bounds.Left + (bounds.Right - bounds.Left) / 2)
+                    {
+                        nx = cur.Right - w;
+                    }
+                    nx = Math.Max(bounds.Left, Math.Min(nx, bounds.Right - w));
+                    ny = Math.Max(bounds.Top, Math.Min(ny, bounds.Bottom - h));
                 }
-                nx = Math.Max(work.Left, Math.Min(nx, work.Right - w));
-                ny = Math.Max(work.Top, Math.Min(ny, work.Bottom - h));
             }
             SetWindowPos(hwnd, HWND_TOPMOST, nx, ny, w, h, SWP_NOACTIVATE);
-            SetWindowRgn(hwnd, IntPtr.Zero, true); // plain rectangle: the corners are made invisible by the key color
-            if (nx != cur.Left || ny != cur.Top)
-            {
-                _onMoved?.Invoke(nx, ny);
-            }
+            SetWindowRgn(hwnd, IntPtr.Zero, true);
         }
         finally
         {
             ReleaseDC(hwnd, hdc);
         }
-        InvalidateRect(hwnd, IntPtr.Zero, true);
-        UpdateWindow(hwnd);
+        RenderHud(hwnd);
     }
 
-    /// <summary>Text outlined in near black, like the game's own HUD figures (readable on any background).</summary>
-    private static void Outlined(IntPtr hdc, IntPtr font, uint color, string text, int left, int top, int right, int bottom, uint align, bool thin = false)
-    {
-        SelectObject(hdc, font);
-        var o = thin ? 1 : Math.Max(1, Sc(1.6));
-        SetTextColor(hdc, Rgb(11, 15, 24));
-        for (var dx = -o; dx <= o; dx++)
-        {
-            for (var dy = -o; dy <= o + 1; dy++)
-            {
-                if (Math.Abs(dx) != o && Math.Abs(dy) < o) continue; // only the ring (and one pixel of drop shadow)
-                var r = new RECT { Left = left + dx, Top = top + dy, Right = right + dx, Bottom = bottom + dy };
-                DrawTextW(hdc, text, -1, ref r, DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP | align);
-            }
-        }
-        SetTextColor(hdc, color);
-        var rc = new RECT { Left = left, Top = top, Right = right, Bottom = bottom };
-        DrawTextW(hdc, text, -1, ref rc, DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP | align); // italic glyphs lean past the box
-    }
-
-    /// <summary>A treasure chest made of three shapes: body, rounded lid, latch.</summary>
-    private static void Chest(IntPtr hdc, int x, int y, int w, int h, uint body, uint lid, uint latch, uint outline)
-    {
-        var pen = CreatePen(0, Math.Max(1, Sc(1.5)), outline);
-        var oldPen = SelectObject(hdc, pen);
-        var lidH = (int)(h * 0.42);
-        var bLid = CreateSolidBrush(lid);
-        var old = SelectObject(hdc, bLid);
-        Chord(hdc, x, y, x + w, y + 2 * lidH, x + w, y + lidH, x, y + lidH);
-        var bBody = CreateSolidBrush(body);
-        SelectObject(hdc, bBody);
-        RoundRect(hdc, x, y + lidH, x + w, y + h, Sc(4), Sc(4));
-        var bLatch = CreateSolidBrush(latch);
-        SelectObject(hdc, bLatch);
-        var lw = Math.Max(3, w / 5);
-        Rectangle(hdc, x + (w - lw) / 2, y + lidH - Sc(2), x + (w + lw) / 2, y + lidH + Math.Max(4, h / 4));
-        SelectObject(hdc, old);
-        SelectObject(hdc, oldPen);
-        DeleteObject(bLid);
-        DeleteObject(bBody);
-        DeleteObject(bLatch);
-        DeleteObject(pen);
-    }
-
-    /// <summary>A five-pointed star (treasures), outlined like the text.</summary>
-    private static void Star(IntPtr hdc, int cx, int cy, int r, uint fill, uint outline)
-    {
-        var pts = new POINT[10];
-        for (var i = 0; i < 10; i++)
-        {
-            var a = -Math.PI / 2 + i * Math.PI / 5;
-            var rr = i % 2 == 0 ? r : r * 0.45;
-            pts[i] = new POINT { X = cx + (int)Math.Round(rr * Math.Cos(a)), Y = cy + (int)Math.Round(rr * Math.Sin(a)) };
-        }
-        var pen = CreatePen(0, Math.Max(1, Sc(1.5)), outline);
-        var brush = CreateSolidBrush(fill);
-        var oldPen = SelectObject(hdc, pen);
-        var old = SelectObject(hdc, brush);
-        Polygon(hdc, pts, pts.Length);
-        SelectObject(hdc, old);
-        SelectObject(hdc, oldPen);
-        DeleteObject(brush);
-        DeleteObject(pen);
-    }
-
-    private static void Disc(IntPtr hdc, int x, int y, int d, uint fill, uint outline, int penW)
-    {
-        var pen = CreatePen(0, penW, outline);
-        var brush = CreateSolidBrush(fill);
-        var oldPen = SelectObject(hdc, pen);
-        var old = SelectObject(hdc, brush);
-        Ellipse(hdc, x, y, x + d, y + d);
-        SelectObject(hdc, old);
-        SelectObject(hdc, oldPen);
-        DeleteObject(brush);
-        DeleteObject(pen);
-    }
-
-    /// <summary>"Label  •  value" right-aligned: pale label, white value.</summary>
-    private static int LabelValue(IntPtr hdc, string label, string value, int left, int right, int top, int height, uint valueColor)
-    {
-        if (value.Length == 0)
-        {
-            Outlined(hdc, _fontHudSmall, Rgb(255, 233, 166), label, left, top, right, top + height, DT_RIGHT, thin: true);
-            return right - TextWidth(hdc, _fontHudSmall, label, out _);
-        }
-        var valueW = TextWidth(hdc, _fontHudSmall, value, out _);
-        Outlined(hdc, _fontHudSmall, valueColor, value, left, top, right, top + height, DT_RIGHT, thin: true);
-        var labelRight = right - valueW;
-        Outlined(hdc, _fontHudSmall, Rgb(255, 233, 166), label + Sep, left, top, labelRight, top + height, DT_RIGHT, thin: true);
-        return labelRight - TextWidth(hdc, _fontHudSmall, label + Sep, out _);
-    }
-
-    private static void PaintStyled(IntPtr hwnd, IntPtr hdc)
+    private static bool RenderHud(IntPtr hwnd, IntPtr previewDc = default)
     {
         GetClientRect(hwnd, out var rc);
-        var key = CreateSolidBrush(KeyColor);
-        FillRect(hdc, ref rc, key);
-        DeleteObject(key);
-        SetBkMode(hdc, TRANSPARENT);
-        var v = _view;
-        var pad = Sc(8);
-        var right = rc.Right - pad - Sc(12); // italic glyphs and their outline lean past the measured width
-        var white = Rgb(255, 255, 255);
-        var gold = Rgb(255, 210, 63);
-        var ink = Rgb(11, 15, 24);
-
-        // Unlocked: a dark backdrop to grab it, and the padlock (locked, only the figures remain, mouse goes through).
-        if (!_locked)
+        var size = new SIZE { Width = rc.Right, Height = rc.Bottom };
+        if (size.Width <= 0 || size.Height <= 0)
         {
-            var pen = CreatePen(0, 1, Rgb(58, 66, 86));
-            var brush = CreateSolidBrush(Rgb(28, 34, 48));
-            var oldPen = SelectObject(hdc, pen);
-            var old = SelectObject(hdc, brush);
-            RoundRect(hdc, 0, 0, rc.Right, rc.Bottom, Sc(12), Sc(12));
-            SelectObject(hdc, old);
-            SelectObject(hdc, oldPen);
-            DeleteObject(brush);
-            DeleteObject(pen);
-            SelectObject(hdc, _fontIcon);
-            SetTextColor(hdc, Rgb(200, 200, 208));
-            var lr = _lockRect;
-            DrawTextW(hdc, "", -1, ref lr, DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX);
+            return false;
         }
 
-        var left = _lockRect.Right;
-        var y = pad;
-        var state = StateRow(v);
-        var live = v.CurrentLive && state.Value.Length > 0;
-
-        // Total, with the chest.
-        var bigW = TextWidth(hdc, _fontHudBig, v.Total, out _);
-        Outlined(hdc, _fontHudBig, live ? gold : white, v.Total, left, y, right, y + _hudBigH, DT_RIGHT);
-        var iw = Sc(26);
-        var ih = Sc(22);
-        var ix = right - bigW - Sc(8) - iw;
-        Chest(hdc, ix, y + (_hudBigH - ih) / 2, iw, ih, gold, Rgb(224, 165, 38), ink, ink);
-        y += _hudBigH + Sc(2);
-
-        // Last match (or the match in progress), session, treasures.
-        var rowH = _hudSmallH;
-        var stateLeft = LabelValue(hdc, state.Label, state.Value, left, right, y, rowH, live ? gold : white);
-        if (state.Dot)
+        var dc = CreateCompatibleDC(IntPtr.Zero);
+        var header = new BITMAPINFOHEADER
         {
-            Disc(hdc, stateLeft - Sc(12), y + rowH / 2 - Sc(4), Sc(9), Rgb(255, 59, 48), ink, 1);
+            biSize = 40, biWidth = size.Width, biHeight = -size.Height, biPlanes = 1, biBitCount = 32,
+        };
+        var bitmap = CreateDIBSection(dc, ref header, 0, out var bits, IntPtr.Zero, 0);
+        if (bitmap == IntPtr.Zero)
+        {
+            DeleteDC(dc);
+            return false;
         }
-        y += rowH + Sc(2);
-        LabelValue(hdc, L.T("Session", "Session", "Sesión"), v.Session, left, right, y, rowH, white);
-        y += rowH + Sc(2);
-        var tw = TextWidth(hdc, _fontHudSmall, v.Treasures, out _);
-        Outlined(hdc, _fontHudSmall, Rgb(214, 190, 255), v.Treasures, left, y, right, y + rowH, DT_RIGHT, thin: true);
-        Star(hdc, right - tw - Sc(12), y + rowH / 2, Sc(8), Rgb(196, 155, 255), ink);
+
+        var previousBitmap = SelectObject(dc, bitmap);
+        try
+        {
+            // Draw the white foreground on black to get an antialiased coverage mask.
+            FillRect(dc, ref rc, GetStockObject(BLACK_BRUSH));
+            SetBkMode(dc, TRANSPARENT);
+            var white = Rgb(255, 255, 255);
+            var locked = _locked;
+            if (!locked)
+            {
+                Text(dc, _fontIcon, white, "\uE785", 0, 0,
+                    _lockRect.Right, _lockRect.Bottom, DT_CENTER | DT_VCENTER);
+            }
+
+            var badge = Sc(25);
+            var inset = (_hudRowH - badge) / 2;
+            var rightBadge = size.Width - badge;
+            var leftBadge = rightBadge - _hudCellW - Sc(15);
+            var stats = HudStats(_view);
+            var numberLift = Sc(2);
+            for (var i = 0; i < stats.Length; i++)
+            {
+                var x = i % 2 == 0 ? leftBadge : rightBadge;
+                var y = i / 2 * _hudRowH;
+                Text(dc, _fontHud, white, stats[i].Value, x - _hudCellW, y - numberLift,
+                    x - Sc(5.5), y + _hudRowH - numberLift, DT_RIGHT | DT_VCENTER | DT_NOCLIP);
+            }
+
+            GdiFlush();
+            var coverage = new int[size.Width * size.Height];
+            Marshal.Copy(bits, coverage, 0, coverage.Length);
+            if (!PaintHudIcons(stats, coverage, size.Width, badge, leftBadge, rightBadge, inset))
+            {
+                return false;
+            }
+            var pixels = new int[coverage.Length];
+            for (var y = 0; y < size.Height; y++)
+            {
+                var withinBadgeRow = (uint)(y % _hudRowH - inset) < (uint)badge;
+                for (var x = 0; x < size.Width; x++)
+                {
+                    var index = y * size.Width + x;
+                    var glyph = coverage[index] & 255;
+                    var withinBadge = withinBadgeRow && ((uint)(x - leftBadge) < (uint)badge || x >= rightBadge);
+                    var backAlpha = !locked ? 200 : withinBadge ? 88 : 0;
+                    if (locked && !withinBadge && x > 0 && x < size.Width - 1 && y > 1)
+                    {
+                        // A one-pixel drop shadow with a soft 3x3 falloff behind the numerals.
+                        var shadow = index - size.Width;
+                        var nearby = (coverage[shadow - 1] & 255) + 2 * (coverage[shadow] & 255)
+                            + (coverage[shadow + 1] & 255);
+                        var upper = (coverage[shadow - size.Width - 1] & 255)
+                            + 2 * (coverage[shadow - size.Width] & 255) + (coverage[shadow - size.Width + 1] & 255);
+                        var lower = (coverage[index - 1] & 255) + 2 * glyph + (coverage[index + 1] & 255);
+                        backAlpha = (upper + 2 * nearby + lower) / 30;
+                    }
+                    // White over neutral black, stored as premultiplied BGRA.
+                    var alpha = glyph + backAlpha * (255 - glyph) / 255;
+                    pixels[index] = alpha << 24 | glyph << 16 | glyph << 8 | glyph;
+                }
+            }
+            Marshal.Copy(pixels, 0, bits, pixels.Length);
+            var blend = new BLENDFUNCTION { SourceConstantAlpha = Alpha, AlphaFormat = 1 };
+            if (previewDc != IntPtr.Zero)
+            {
+                var previewBg = CreateSolidBrush(Rgb(64, 87, 67));
+                FillRect(previewDc, ref rc, previewBg);
+                DeleteObject(previewBg);
+                return AlphaBlend(previewDc, 0, 0, size.Width, size.Height, dc, 0, 0, size.Width, size.Height, blend);
+            }
+
+            var origin = new POINT();
+            return UpdateLayeredWindow(hwnd, IntPtr.Zero, IntPtr.Zero, ref size, dc, ref origin, 0, ref blend, ULW_ALPHA);
+        }
+        finally
+        {
+            SelectObject(dc, previousBitmap);
+            DeleteObject(bitmap);
+            DeleteDC(dc);
+        }
+    }
+
+    private static bool PaintHudIcons(HudStat[] stats, int[] coverage, int width, int badge,
+        int leftBadge, int rightBadge, int inset)
+    {
+        // GDI polygons and ellipses use hard edges. Draw the four glyphs in a single
+        // oversampled strip, then average each block into the window's coverage mask.
+        const int samples = 4;
+        var tile = badge * samples;
+        var stripWidth = tile * stats.Length;
+        var strip = new RECT { Right = stripWidth, Bottom = tile };
+        var dc = CreateCompatibleDC(IntPtr.Zero);
+        var header = new BITMAPINFOHEADER
+        {
+            biSize = 40, biWidth = stripWidth, biHeight = -tile, biPlanes = 1, biBitCount = 32,
+        };
+        var bitmap = CreateDIBSection(dc, ref header, 0, out var bits, IntPtr.Zero, 0);
+        if (bitmap == IntPtr.Zero)
+        {
+            DeleteDC(dc);
+            return false;
+        }
+
+        var previousBitmap = SelectObject(dc, bitmap);
+        try
+        {
+            FillRect(dc, ref strip, GetStockObject(BLACK_BRUSH));
+            for (var i = 0; i < stats.Length; i++)
+            {
+                PaintHudIcon(dc, stats[i].Icon, i * tile, tile);
+            }
+            GdiFlush();
+
+            var mask = new int[stripWidth * tile];
+            Marshal.Copy(bits, mask, 0, mask.Length);
+            for (var i = 0; i < stats.Length; i++)
+            {
+                var badgeX = i % 2 == 0 ? leftBadge : rightBadge;
+                var badgeY = i / 2 * _hudRowH + inset;
+                for (var y = 0; y < badge; y++)
+                {
+                    for (var x = 0; x < badge; x++)
+                    {
+                        var start = y * samples * stripWidth + i * tile + x * samples;
+                        var sum = 0;
+                        for (var dy = 0; dy < samples; dy++)
+                        {
+                            for (var dx = 0; dx < samples; dx++)
+                            {
+                                sum += mask[start + dy * stripWidth + dx] & 255;
+                            }
+                        }
+                        coverage[(badgeY + y) * width + badgeX + x] = sum / (samples * samples);
+                    }
+                }
+            }
+            return true;
+        }
+        finally
+        {
+            SelectObject(dc, previousBitmap);
+            DeleteObject(bitmap);
+            DeleteDC(dc);
+        }
+    }
+
+    // Minimap-style counter silhouettes on a 25-unit grid.
+    private static void PaintHudIcon(IntPtr hdc, HudIcon icon, int x, int tile)
+    {
+        var white = GetStockObject(WHITE_BRUSH);
+        var black = GetStockObject(BLACK_BRUSH);
+        var oldBrush = SelectObject(hdc, white);
+        var oldPen = SelectObject(hdc, GetStockObject(NULL_PEN));
+        // Center the glyph within the badge while leaving the same inset on each edge.
+        int Y(double v) => (int)Math.Round((12.5 + (v - 12.5) * 0.875) * tile / 25);
+        int X(double v) => x + Y(v);
+
+        void Shape(IntPtr brush, params (double X, double Y)[] points)
+        {
+            var pixels = points.Select(p => new POINT { X = X(p.X), Y = Y(p.Y) }).ToArray();
+            SelectObject(hdc, brush);
+            Polygon(hdc, pixels, pixels.Length);
+        }
+
+        void Oval(IntPtr brush, double l, double t, double r, double b)
+        {
+            SelectObject(hdc, brush);
+            Ellipse(hdc, X(l), Y(t), X(r), Y(b));
+        }
+
+        switch (icon)
+        {
+            case HudIcon.Chest:
+                Shape(white, (3, 10), (5, 6), (8, 4.5), (17, 4.5), (20, 6), (22, 10), (22, 18),
+                    (20.5, 20.5), (4.5, 20.5), (3, 18));
+                Shape(black, (3, 10.5), (22, 10.5), (22, 12), (3, 12));
+                Shape(white, (10, 9.5), (15, 9.5), (15, 14.5), (10, 14.5));
+                Shape(black, (11.7, 11.2), (13.3, 11.2), (13.3, 12.8), (11.7, 12.8));
+                break;
+
+            case HudIcon.Treasure:
+                Shape(white, (7, 4.5), (18, 4.5), (22, 9), (12.5, 21), (3, 9));
+                Shape(black, (5, 8.6), (20, 8.6), (19, 10), (15, 10), (12.5, 17.5),
+                    (10, 10), (6, 10));
+                break;
+
+            case HudIcon.Session:
+                Shape(white, (4, 5), (6.4, 5), (6.4, 20), (4, 20));
+                Shape(white, (8.7, 5), (11.1, 5), (11.1, 20), (8.7, 20));
+                Shape(white, (13.4, 5), (15.8, 5), (15.8, 20), (13.4, 20));
+                Shape(white, (18.1, 5), (20.5, 5), (20.5, 20), (18.1, 20));
+                Shape(white, (2.5, 15.5), (21.4, 7.2), (22.5, 9.5), (3.6, 17.8));
+                break;
+
+            case HudIcon.MatchHistory:
+                Oval(white, 3.5, 3.5, 22, 22);
+                Oval(black, 5.6, 5.6, 19.9, 19.9);
+                Shape(black, (2.5, 3), (10, 3), (10, 8), (2.5, 10));
+                Shape(white, (2.5, 4.5), (4.6, 4.5), (4.6, 8), (8.1, 8), (8.1, 10.1), (2.5, 10.1));
+                Shape(white, (11.7, 7.7), (13.6, 7.7), (13.6, 12), (17, 13.9),
+                    (16, 15.6), (11.7, 13.1));
+                break;
+        }
+        SelectObject(hdc, oldPen);
+        SelectObject(hdc, oldBrush);
     }
 
     private static uint Rgb(byte r, byte g, byte b) => (uint)(r | (g << 8) | (b << 16));
@@ -833,15 +953,17 @@ public static class NativeOverlay
     // ---- Win32 ------------------------------------------------------------------------------
     private delegate IntPtr WndProcDelegate(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);
 
+    private const int SM_CXSCREEN = 0, SM_CYSCREEN = 1, NULL_PEN = 8, WHITE_BRUSH = 0, BLACK_BRUSH = 4;
+    private const uint WM_DISPLAYCHANGE = 0x007E, WM_APP_SNAP = 0x8006;
     private const uint WS_POPUP = 0x80000000;
     private const uint WS_EX_TOPMOST = 0x00000008, WS_EX_TRANSPARENT = 0x00000020, WS_EX_TOOLWINDOW = 0x00000080, WS_EX_LAYERED = 0x00080000, WS_EX_NOACTIVATE = 0x08000000;
     private const int GWL_EXSTYLE = -20, HTCLIENT = 1;
     private const uint WM_SETCURSOR = 0x0020, WM_LBUTTONUP = 0x0202, WM_APP_LOCK = 0x8003, VK_L = 0x4C, SWP_FRAMECHANGED = 0x20;
     private static readonly IntPtr IDC_HAND = new(32649);
-    private const uint LWA_ALPHA = 0x2, LWA_COLORKEY = 0x1;
+    private const uint LWA_ALPHA = 0x2, ULW_ALPHA = 0x2;
     private const int SW_HIDE = 0, SW_SHOWNOACTIVATE = 4;
     private const uint WM_DESTROY = 0x0002, WM_PAINT = 0x000F, WM_NCHITTEST = 0x0084, WM_NCRBUTTONUP = 0x00A5,
-        WM_TIMER = 0x0113, WM_EXITSIZEMOVE = 0x0232, WM_APP_TOGGLE = 0x8001, WM_PRINTCLIENT = 0x0318, WM_APP_RELAYOUT = 0x8002, WM_HOTKEY = 0x0312, WM_APP_APPEARANCE = 0x8004, WM_APP_STOP = 0x8005;
+        WM_EXITSIZEMOVE = 0x0232, WM_APP_TOGGLE = 0x8001, WM_PRINTCLIENT = 0x0318, WM_APP_RELAYOUT = 0x8002, WM_HOTKEY = 0x0312, WM_APP_APPEARANCE = 0x8004, WM_APP_STOP = 0x8005;
     private const uint MOD_CONTROL = 0x2, MOD_SHIFT = 0x4, MOD_NOREPEAT = 0x4000, VK_O = 0x4F;
     private const int HTCAPTION = 2;
     private const int TRANSPARENT = 1, LOGPIXELSY = 90;
@@ -867,6 +989,12 @@ public static class NativeOverlay
 
     [StructLayout(LayoutKind.Sequential)]
     private struct POINT { public int X, Y; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SIZE { public int Width, Height; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BLENDFUNCTION { public byte BlendOp, BlendFlags, SourceConstantAlpha, AlphaFormat; }
 
     [StructLayout(LayoutKind.Sequential)]
     private struct MSG
@@ -911,11 +1039,12 @@ public static class NativeOverlay
     [DllImport("user32.dll")] private static extern bool EndPaint(IntPtr hwnd, ref PAINTSTRUCT ps);
     [DllImport("user32.dll")] private static extern int FillRect(IntPtr hdc, ref RECT rect, IntPtr brush);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int DrawTextW(IntPtr hdc, string text, int count, ref RECT rect, uint format);
-    [DllImport("user32.dll")] private static extern UIntPtr SetTimer(IntPtr hwnd, UIntPtr id, uint ms, IntPtr proc);
     [DllImport("user32.dll")] private static extern IntPtr LoadCursorW(IntPtr instance, IntPtr name);
     [DllImport("user32.dll")] private static extern IntPtr GetDC(IntPtr hwnd);
     [DllImport("user32.dll")] private static extern int ReleaseDC(IntPtr hwnd, IntPtr hdc);
     [DllImport("user32.dll")] private static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll")] private static extern int GetSystemMetrics(int index);
+    [DllImport("gdi32.dll")] private static extern IntPtr GetStockObject(int index);
     [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")] private static extern IntPtr GetWindowLongPtrW(IntPtr hwnd, int index);
     [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW")] private static extern IntPtr SetWindowLongPtrW(IntPtr hwnd, int index, IntPtr value);
     [DllImport("user32.dll")] private static extern IntPtr SetCursor(IntPtr cursor);
@@ -946,6 +1075,17 @@ public static class NativeOverlay
     [DllImport("user32.dll")] private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
     [DllImport("user32.dll")] private static extern bool GetMonitorInfoW(IntPtr monitor, ref MONITORINFO info);
     [DllImport("user32.dll")] private static extern bool UpdateWindow(IntPtr hwnd);
+    [DllImport("user32.dll")] private static extern IntPtr SendMessageW(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")]
+    private static extern bool UpdateLayeredWindow(IntPtr hwnd, IntPtr dst, IntPtr position, ref SIZE size,
+        IntPtr src, ref POINT origin, uint key, ref BLENDFUNCTION blend, uint flags);
+    [DllImport("gdi32.dll")]
+    private static extern IntPtr CreateDIBSection(IntPtr dc, ref BITMAPINFOHEADER info, uint usage, out IntPtr bits, IntPtr section, uint offset);
+    [DllImport("gdi32.dll")] private static extern bool GdiFlush();
+    [DllImport("gdi32.dll")] private static extern bool Ellipse(IntPtr hdc, int left, int top, int right, int bottom);
+    [DllImport("msimg32.dll")]
+    private static extern bool AlphaBlend(IntPtr dst, int dx, int dy, int dw, int dh,
+        IntPtr src, int sx, int sy, int sw, int sh, BLENDFUNCTION blend);
     [DllImport("user32.dll")] private static extern bool PrintWindow(IntPtr hwnd, IntPtr hdc, uint flags);
     [DllImport("gdi32.dll")] private static extern IntPtr CreateCompatibleDC(IntPtr hdc);
     [DllImport("gdi32.dll")] private static extern IntPtr CreateCompatibleBitmap(IntPtr hdc, int w, int h);
@@ -955,11 +1095,7 @@ public static class NativeOverlay
     [DllImport("gdi32.dll")] private static extern bool DeleteObject(IntPtr obj);
     [DllImport("gdi32.dll")] private static extern int SetBkMode(IntPtr hdc, int mode);
     [DllImport("gdi32.dll")] private static extern uint SetTextColor(IntPtr hdc, uint color);
-    [DllImport("gdi32.dll")] private static extern IntPtr CreatePen(int style, int width, uint color);
-    [DllImport("gdi32.dll")] private static extern bool Ellipse(IntPtr hdc, int l, int t, int r, int b);
+    [DllImport("gdi32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetTextFaceW(IntPtr hdc, int count, System.Text.StringBuilder face);
     [DllImport("gdi32.dll")] private static extern bool Polygon(IntPtr hdc, POINT[] points, int count);
-    [DllImport("gdi32.dll")] private static extern bool Rectangle(IntPtr hdc, int l, int t, int r, int b);
-    [DllImport("gdi32.dll")] private static extern bool RoundRect(IntPtr hdc, int l, int t, int r, int b, int w, int h);
-    [DllImport("gdi32.dll")] private static extern bool Chord(IntPtr hdc, int l, int t, int r, int b, int x1, int y1, int x2, int y2);
-    [DllImport("user32.dll")] private static extern int FrameRect(IntPtr hdc, ref RECT rect, IntPtr brush);
 }

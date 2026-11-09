@@ -102,6 +102,7 @@ public sealed class Config
 
     /// <summary>Look of the overlay: "hud" (figures only, like the game's HUD) or "classic" (dark card).</summary>
     public string OverlayStyle { get; set; } = "hud";
+    public bool OverlayHudAutoPosition { get; set; } = true;
     public int? OverlayX { get; set; }
     public int? OverlayY { get; set; }
     /// <summary>Locked overlay = click-through, cannot be moved (Ctrl+Shift+L to toggle).</summary>

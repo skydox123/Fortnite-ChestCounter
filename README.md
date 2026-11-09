@@ -86,12 +86,9 @@ With this option, a tiny invisible process starts with Windows and checks every 
 
 ## The overlay
 
-Just the figures, outlined like the game's own, with no background: put it under the minimap and it blends into the HUD.
+The HUD overlay opens below the minimap on the primary display. White numbers sit beside square translucent icon plates. The chest shows total chests, the gem shows treasures, the tally shows session chests, and the history clock shows the current or last match. A dash means the current replay count is unavailable. The HUD uses Arial Black by default. To use another installed font, set the CHESTCOUNTER_HUD_FONT environment variable to its Windows font family name before starting the counter.
 
-- **Big**: your **total** chests, with the golden chest.
-- **Last**: the chests of your last match. During a match: **● In a match** (its chests are counted at the end).
-- **Session**: the chests since the counter was started.
-- **★**: your treasures.
+The default position follows the minimap proportions in a 16:9 Fortnite view. If your HUD scale or monitor setup differs, unlock and drag the overlay into place. Use **Settings → Snap below minimap** to restore automatic positioning.
 
 | Shortcut | What it does |
 |---|---|
